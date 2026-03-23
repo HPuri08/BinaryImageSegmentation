@@ -1,0 +1,319 @@
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from scipy import ndimage
+from skimage.transform import resize
+from util import load_dataset
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import CyclicLR
+from PIL import Image
+from sklearn.model_selection import KFold
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# Memory Monitoring
+def print_memory_usage():
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated(device) / 1024**3
+        reserved = torch.cuda.memory_reserved(device) / 1024**3
+        print(f"GPU Memory: Allocated {allocated:.2f} GB, Reserved {reserved:.2f} GB")
+
+# Model Definition
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch, out_ch, dropout_prob=0.3):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout_prob)
+        )
+        self.residual = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x):
+        residual = self.residual(x)
+        out = self.conv(x)
+        return out + residual
+
+class AttentionGate(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.gating = nn.Conv2d(in_ch, out_ch, 1)
+        self.attention = nn.Conv2d(out_ch + out_ch, out_ch, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, g):
+        g = self.gating(g)
+        phi = self.attention(torch.cat([x, g], dim=1))
+        alpha = self.sigmoid(phi)
+        return x * alpha
+
+class UNet(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.down1 = DoubleConv(in_ch, 64)
+        self.pool1 = nn.MaxPool2d(2)
+        self.down2 = DoubleConv(64, 128)
+        self.pool2 = nn.MaxPool2d(2)
+        self.down3 = DoubleConv(128, 256)
+        self.pool3 = nn.MaxPool2d(2)
+        self.bottom = DoubleConv(256, 512)
+        self.up3 = nn.ConvTranspose2d(512, 256, 2, stride=2)
+        self.att3 = AttentionGate(256, 256)
+        self.conv3 = DoubleConv(512, 256)
+        self.up2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.att2 = AttentionGate(128, 128)
+        self.conv2 = DoubleConv(256, 128)
+        self.up1 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.att1 = AttentionGate(64, 64)
+        self.conv1 = DoubleConv(128, 64)
+        self.final = nn.Conv2d(64, out_ch, 1)
+
+    def forward(self, x):
+        d1 = self.down1(x)
+        p1 = self.pool1(d1)
+        d2 = self.down2(p1)
+        p2 = self.pool2(d2)
+        d3 = self.down3(p2)
+        p3 = self.pool3(d3)
+        b = self.bottom(p3)
+
+        u3 = self.up3(b)
+        diff_h = d3.size()[2] - u3.size()[2]
+        diff_w = d3.size()[3] - u3.size()[3]
+        d3 = d3[:, :, diff_h//2:(diff_h//2 + u3.size()[2]), diff_w//2:(diff_w//2 + u3.size()[3])] if diff_h > 0 or diff_w > 0 else d3
+        d3 = self.att3(d3, u3)
+        c3 = self.conv3(torch.cat([u3, d3], 1))
+
+        u2 = self.up2(c3)
+        diff_h = d2.size()[2] - u2.size()[2]
+        diff_w = d2.size()[3] - u2.size()[3]
+        d2 = d2[:, :, diff_h//2:(diff_h//2 + u2.size()[2]), diff_w//2:(diff_w//2 + u2.size()[3])] if diff_h > 0 or diff_w > 0 else d2
+        d2 = self.att2(d2, u2)
+        c2 = self.conv2(torch.cat([u2, d2], 1))
+
+        u1 = self.up1(c2)
+        diff_h = d1.size()[2] - u1.size()[2]
+        diff_w = d1.size()[3] - u1.size()[3]
+        d1 = d1[:, :, diff_h//2:(diff_h//2 + u1.size()[2]), diff_w//2:(diff_w//2 + u1.size()[3])] if diff_h > 0 or diff_w > 0 else d1
+        d1 = self.att1(d1, u1)
+        c1 = self.conv1(torch.cat([u1, d1], 1))
+
+        return self.final(c1)
+
+# Input Preprocessing
+def prepare_inputs(images, scribbles, sigma=50.0, target_size=(256, 344)): 
+    num, h, w, _ = images.shape
+    dist_fg = np.zeros((num, h, w), dtype=np.float32)
+    dist_bg = np.zeros((num, h, w), dtype=np.float32)
+    for i in range(num):
+        mask_fg = (scribbles[i] == 1)
+        mask_bg = (scribbles[i] == 0)
+        dist_fg[i] = ndimage.distance_transform_edt(~mask_fg)
+        dist_bg[i] = ndimage.distance_transform_edt(~mask_bg)
+    dist_fg = np.exp(- (dist_fg ** 2) / (2 * sigma ** 2))
+    dist_bg = np.exp(- (dist_bg ** 2) / (2 * sigma ** 2))
+    images_norm = images.astype(np.float32) / 255.0
+   
+    if np.random.random() > 0.5:
+        images_norm = np.flip(images_norm, axis=2)
+        dist_fg = np.flip(dist_fg, axis=1)
+        dist_bg = np.flip(dist_bg, axis=1)
+    images_resized = np.array([resize(img, target_size + (3,), mode='constant', preserve_range=True) for img in images_norm])
+    dist_fg_resized = np.array([resize(dist_fg[i][..., np.newaxis], target_size + (1,), mode='constant', preserve_range=True) for i in range(num)])
+    dist_bg_resized = np.array([resize(dist_bg[i][..., np.newaxis], target_size + (1,), mode='constant', preserve_range=True) for i in range(num)])
+    inputs = np.concatenate((images_resized, dist_fg_resized, dist_bg_resized), axis=3)
+    return inputs
+
+# mIoU Computation
+def compute_detailed_miou(pred, gt):
+    pred = pred.flatten()
+    gt = gt.flatten()
+    inter_obj = (pred & gt).sum()
+    union_obj = (pred | gt).sum()
+    obj_iou = inter_obj / union_obj if union_obj > 0 else 0.0
+    inter_bg = ((1 - pred) & (1 - gt)).sum()
+    union_bg = ((1 - pred) | (1 - gt)).sum()
+    bg_iou = inter_bg / union_bg if union_bg > 0 else 0.0
+    miou = (obj_iou + bg_iou) / 2 if (union_obj > 0 or union_bg > 0) else 0.0
+    return miou, bg_iou, obj_iou
+
+# Dice Loss
+def dice_loss(pred, target, smooth=1e-7):
+    pred = torch.sigmoid(pred)  # [N, 1, H, W]
+    intersection = (pred * target).sum(dim=(2, 3))
+    union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+    dice = (2 * intersection + smooth) / (union + smooth)
+    return 1 - dice.mean()
+
+# Store Predictions Function
+def store_preds(preds, folder, pred_dir, fnames, palette, original_size=(500, 375)):
+    from skimage.transform import resize
+    pred_path = os.path.join(folder, pred_dir)
+    os.makedirs(pred_path, exist_ok=True)
+    for pred, fname in zip(preds, fnames):
+        # Resize prediction to original size (500, 375)
+        pred_resized = resize(pred, original_size, mode='constant', preserve_range=True, anti_aliasing=True)
+        pred_resized = (pred_resized > 0.5).astype(np.uint8)  # Ensure binary output after resizing
+        pred_img = Image.fromarray(pred_resized, mode='P')
+        pred_img.putpalette(palette)
+        pred_img.save(os.path.join(pred_path, fname))
+
+# Main Training and Evaluation Script
+if __name__ == "__main__":
+    # Load Training Dataset
+    images_train, scrib_train, gt_train, fnames_train, palette = load_dataset(
+        "dataset/train", "images", "scribbles", "ground_truth"
+    )
+    inputs_train = prepare_inputs(images_train, scrib_train)
+    inputs_tensor = torch.from_numpy(inputs_train.transpose(0, 3, 1, 2)).float()
+    gt_resized = np.array([resize(gt, (256, 344), mode='constant', preserve_range=True) for gt in gt_train])
+    gt_tensor = torch.from_numpy(gt_resized.astype(np.float32)).unsqueeze(1)
+    print(f"inputs_tensor shape: {inputs_tensor.shape}")
+    print(f"gt_tensor shape: {gt_tensor.shape}")
+
+    # Hyperparameters
+    batch_size = 8  # Safe for RTX 4070
+    num_epochs = 110
+    k_folds = 5
+    initial_lr = 1e-5
+    max_lr = 3e-4
+    warmup_epochs = 5
+    alpha_bce = 0.5
+    alpha_dice = 0.5
+
+    # K-Fold Cross-Validation
+    kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+    best_miou = 0.0
+    best_bg_iou = 0.0
+    best_obj_iou = 0.0
+    best_model_state = None
+    for fold, (train_idx, val_idx) in enumerate(kf.split(inputs_tensor)):
+        print(f'Fold {fold+1}/{k_folds}')
+        train_dataset = TensorDataset(inputs_tensor[train_idx], gt_tensor[train_idx])
+        val_dataset = TensorDataset(inputs_tensor[val_idx], gt_tensor[val_idx])
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+        print(f"train_loader length: {len(train_loader)}")
+        print_memory_usage()
+
+        # Initialize Model and Optimizer
+        model = UNet(in_ch=5, out_ch=1).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=initial_lr)
+        scheduler = CyclicLR(optimizer, base_lr=1e-5, max_lr=max_lr, step_size_up=5*len(train_loader), mode='triangular2')
+        scaler = GradScaler()
+        criterion_bce = nn.BCEWithLogitsLoss()
+
+        # Training Loop
+        for epoch in range(num_epochs):
+            model.train()
+            train_loss = 0.0
+            if epoch < warmup_epochs:
+                lr = initial_lr + (max_lr - initial_lr) * (epoch / warmup_epochs)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr
+            
+            for inputs, targets in train_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                optimizer.zero_grad()
+                with autocast():
+                    outputs = model(inputs)
+                    loss = alpha_bce * criterion_bce(outputs, targets) + alpha_dice * dice_loss(outputs, targets)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                if epoch >= warmup_epochs:
+                    scheduler.step()
+                train_loss += loss.item()
+            print(f'Fold {fold+1}, Epoch {epoch+1}/{num_epochs}, Loss: {train_loss / len(train_loader)}, LR: {optimizer.param_groups[0]["lr"]}')
+            print_memory_usage()
+            
+            # Validation
+            model.eval()
+            val_mious = []
+            val_bg_ious = []
+            val_obj_ious = []
+            with torch.no_grad():
+                for inputs, targets in val_loader:
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    with autocast():
+                        outputs = model(inputs)
+                    preds = (torch.sigmoid(outputs) > 0.5).cpu().numpy().astype(int)
+                    targets_np = targets.cpu().numpy().astype(int).squeeze(1)
+                    for i in range(preds.shape[0]):
+                        if preds[i, 0].shape != targets_np[i].shape:
+                            min_h = min(preds[i, 0].shape[0], targets_np[i].shape[0])
+                            min_w = min(preds[i, 0].shape[1], targets_np[i].shape[1])
+                            preds_cropped = preds[i, 0][:min_h, :min_w]
+                            targets_cropped = targets_np[i][:min_h, :min_w]
+                            miou, bg_iou, obj_iou = compute_detailed_miou(preds_cropped, targets_cropped)
+                        else:
+                            miou, bg_iou, obj_iou = compute_detailed_miou(preds[i, 0], targets_np[i])
+                        val_mious.append(miou)
+                        val_bg_ious.append(bg_iou)
+                        val_obj_ious.append(obj_iou)
+            
+            avg_miou = np.mean(val_mious) if val_mious else 0.0
+            avg_bg_iou = np.mean(val_bg_ious) if val_bg_ious else 0.0
+            avg_obj_iou = np.mean(val_obj_ious) if val_obj_ious else 0.0
+            print(f'Fold {fold+1}, Validation mIoU: {avg_miou}, Background IoU: {avg_bg_iou}, Object IoU: {avg_obj_iou}')
+            print_memory_usage()
+            
+            if avg_miou > best_miou:
+                best_miou = avg_miou
+                best_bg_iou = avg_bg_iou
+                best_obj_iou = avg_obj_iou
+                best_model_state = model.state_dict()
+                print(f"New best model saved - mIoU: {best_miou}, Background IoU: {best_bg_iou}, Object IoU: {best_obj_iou}")
+        
+        # Save Best Model for Each Fold
+        if best_model_state is not None:
+            torch.save(best_model_state, f'best_model__bihari_enhanced_2_fold_{fold+1}.pth')
+            print(f"Best model saved with mIoU: {best_miou}, Background IoU: {best_bg_iou}, Object IoU: {best_obj_iou}, for fold: {fold+1}")
+
+    # Save Best Model
+    if best_model_state is not None:
+        torch.save(best_model_state, 'best_model__bihari_enhanced_2.pth')
+        print(f"Training completed. Best model saved with mIoU: {best_miou}, Background IoU: {best_bg_iou}, Object IoU: {best_obj_iou}")
+
+    # Load Test Dataset
+    print("Loading test dataset...")
+    images_test, scrib_test, _, fnames_test, _ = load_dataset(
+        "dataset/test", "images", "scribbles", None
+    )
+    inputs_test = prepare_inputs(images_test, scrib_test)
+    inputs_test_tensor = torch.from_numpy(inputs_test.transpose(0, 3, 1, 2)).float()
+    test_dataset = TensorDataset(inputs_test_tensor)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
+    print(f"Test samples: {len(test_dataset)}")
+    print_memory_usage()
+
+    # Generate Test Predictions
+    model.load_state_dict(best_model_state)
+    model.eval()
+    test_preds = []
+    test_fnames = []
+    with torch.no_grad():
+        for i, (inputs,) in enumerate(test_loader):
+            print(f"Generating prediction for test batch {i+1}/{len(test_loader)}")
+            inputs = inputs.to(device)
+            with autocast():
+                outputs = model(inputs)
+            pred = (torch.sigmoid(outputs) > 0.5).cpu().numpy().astype(int).squeeze(1)  # [1, H, W]
+            # Resize prediction to original size (500, 375)
+            pred_resized = resize(pred[0], (500, 375), mode='constant', preserve_range=True, anti_aliasing=True)
+            pred_resized = (pred_resized > 0.5).astype(np.uint8)  # Ensure binary output
+            test_preds.append(pred_resized)
+            test_fnames.append(fnames_test[i])
+            print_memory_usage()
+    
+    # Store Test Predictions
+    store_preds(test_preds, 'dataset/test', 'predictions', test_fnames, palette)
+    print("Test predictions stored in dataset/test/predictions")
