@@ -11,6 +11,7 @@ and produce full-resolution binary masks at inference time.
 # 2 Methodology
 
 2.1 Data Preprocessing and Analysis
+
 For the training set, both full ground-truth masks and sparse scribble annotations were provided. During
 training, the ground-truth masks served as the supervision signal for loss computation, while the scribbles
 were used to construct auxiliary distance maps that enrich the input representation. Specifically, we com-
@@ -32,9 +33,11 @@ with sparse scribbles. Future work could include visualization of scribble distr
 balance, which might help explain model behavior.
 
 2.2 Model Architectures
+
 All experiments were implemented in Python 3.11 using PyTorch 2.2 for model building and training, scikit-
 image for resizing and distance transforms, scipy.ndimage for distance computations, and NumPy for numerical
 operations.
+
 Baseline UNet: The UNet architecture, originally proposed for biomedical image segmentation, employs a sym-
 metric encoder-decoder structure that excels at capturing multi-scale features while preserving spatial information.
 The encoder consists of successive downsampling stages, each comprising DoubleConv blocks—pairs of 3x3
@@ -59,6 +62,7 @@ efficiency but adds interpretability and robustness, allowing the model to bette
 boundary delineation in challenging images with complex backgrounds or varying object scales.
 
 2.3 Training Setup
+
 We train both models from scratch using PyTorch. During training, the full ground-truth segmentation masks were
 used as supervision to compute the loss, while the scribbles contributed through the distance maps included in the
 input representation. Training details are as follows:
@@ -81,17 +85,41 @@ values (mIoU):
 2 (𝐼𝑜𝑈𝑏𝑔 + 𝐼𝑜𝑈𝑜𝑏 𝑗 ) (2)
 
 # 3 Results
+Table 1 summarizes the results obtained for both the baseline UNet and the Attention UNet. The Attention UNet
+consistently outperformed the baseline, achieving a higher mIoU and showing notable improvements in object
+IoU. While the baseline UNet provided reasonable background segmentation, it often struggled with precise object
+boundaries, particularly in cluttered or ambiguous regions. The inclusion of Attention Gates alleviated this issue by
+suppressing irrelevant activations in the encoder feature maps and enhancing the focus on relevant object regions,
+thereby improving localization.
+
+Figure 1illustrates qualitative predictions on the test set, where only scribble annotations were provided. Despite the
+lack of ground-truth masks for evaluation, the visual results highlight that the Attention UNet generates sharper and
+more complete object masks compared to the baseline. In particular, the model demonstrates stronger robustness in
+delineating object boundaries and handling complex backgrounds, aligning well with the quantitative improvements
+observed in validation experiments.
+
 <img width="461" height="130" alt="image" src="https://github.com/user-attachments/assets/957503e7-532e-4537-857f-957be1595342" />
 
 
 
-                        
+
+<img width="297" height="472" alt="image" src="https://github.com/user-attachments/assets/31b18224-799d-4346-9892-8d313f02ba23" />
 
 
 
+# 4 Discussion
 
+Attention Gates led to a clear gain in foreground delineation, lifting object IoU in difficult scenes with heavy
+clutter, while maintaining strong background discrimination across folds. This aligns with the intuition that gating
+suppresses irrelevant encoder features and amplifies salient regions suggested by scribbles, yielding more precise
+boundaries around the object of interest. The improvement came with a modest increase in computation due to
+additional 1×1 convolutions and gating operations on skip paths, but the accuracy gains outweighed the extra
+cost in this setting. Finally, 5-fold cross-validation with consistent training hyperparameters stabilized selection
+and mitigated variance, producing a reliable estimate of generalization and guiding the choice of the attention
+augmented model. Although no robustness or fairness analysis was conducted, Attention Gates inherently provide
+interpretability by highlighting salient regions.
 
-# 4 Conclusion
+# 5 Conclusion
 In this project, we successfully developed and evaluated an Attention U-Net model for weakly supervised binary
 image segmentation. By leveraging distance transforms from sparse scribbles and incorporating attention gates,
 our model achieved a promising mIoU of 0.773 on the validation data. The results underscore the effectiveness of
