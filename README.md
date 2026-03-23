@@ -81,12 +81,11 @@ values (mIoU):
 2 (𝐼𝑜𝑈𝑏𝑔 + 𝐼𝑜𝑈𝑜𝑏 𝑗 ) (2)
 
 # 3 Results
-
-                                   <img width="461" height="130" alt="image" src="https://github.com/user-attachments/assets/957503e7-532e-4537-857f-957be1595342" />
-
+<img width="461" height="130" alt="image" src="https://github.com/user-attachments/assets/957503e7-532e-4537-857f-957be1595342" />
 
 
-                                   <img width="275" height="455" alt="image" src="https://github.com/user-attachments/assets/3232bc61-4f16-4df1-8844-d93eeaefc30d" />
+
+                        
 
 
 
